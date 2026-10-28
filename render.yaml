@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: handle-hunt
+    runtime: python
+    plan: free
+    buildCommand: "echo no build step"
+    startCommand: python3 handle_hunt.py
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: TRUST_PROXY
+        value: "1"
+      - key: AUTH_USER
+        sync: false
+      - key: AUTH_PASS
+        sync: false
