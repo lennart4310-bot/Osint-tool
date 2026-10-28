@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+Handle Hunt - a local username lookup tool with a browser UI.
+
+Run:   python3 handle_hunt.py
+Open:  http://127.0.0.1:8765
+
+No dependencies (standard library only). Binds to localhost only.
+Checks whether a username/handle has a public profile on selected sites.
+Use it on your own handles, for security research on accounts you are
+authorised to investigate, or for brand/impersonation checks.
+"""
+import json, re, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs, quote
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+# kind: status      -> 200 = found, 404 = not found
+#       text_absent -> 200 but body contains `absent` = not found
+#       json_empty  -> body is [] / null / {} = not found
+# Sites with kind "link" have no reliable public lookup (login walls,
+# bot protection), so the tool builds a search link to open manually.
+SITES = [
+    {"id": "github",   "name": "GitHub",     "cat": "Dev",      "kind": "status",
+     "check": "https://api.github.com/users/{u}", "profile": "https://github.com/{u}"},
+    {"id": "gitlab",   "name": "GitLab",     "cat": "Dev",      "kind": "json_empty",
+     "check": "https://gitlab.com/api/v4/users?username={u}", "profile": "https://gitlab.com/{u}"},
+    {"id": "codeberg", "name": "Codeberg",   "cat": "Dev",      "kind": "status",
+     "check": "https://codeberg.org/{u}", "profile": "https://codeberg.org/{u}"},
+    {"id": "devto",    "name": "DEV",        "cat": "Dev",      "kind": "status",
+     "check": "https://dev.to/api/users/by_username?url={u}", "profile": "https://dev.to/{u}"},
+    {"id": "hn",       "name": "Hacker News","cat": "Dev",      "kind": "json_empty",
+     "check": "https://hacker-news.firebaseio.com/v0/user/{u}.json", "profile": "https://news.ycombinator.com/user?id={u}"},
+    {"id": "docker",   "name": "Docker Hub", "cat": "Dev",      "kind": "status",
+     "check": "https://hub.docker.com/v2/users/{u}/", "profile": "https://hub.docker.com/u/{u}"},
+    {"id": "keybase",  "name": "Keybase",    "cat": "Dev",      "kind": "text_absent", "absent": "[null]",
+     "check": "https://keybase.io/_/api/1.0/user/lookup.json?usernames={u}", "profile": "https://keybase.io/{u}"},
+    {"id": "replit",   "name": "Replit",     "cat": "Dev",      "kind": "status",
+     "check": "https://replit.com/@{u}", "profile": "https://replit.com/@{u}"},
+
+    {"id": "minecraft","name": "Minecraft",  "cat": "Gaming",   "kind": "status",
+     "check": "https://api.mojang.com/users/profiles/minecraft/{u}", "profile": "https://namemc.com/profile/{u}"},
+    {"id": "steam",    "name": "Steam",      "cat": "Gaming",   "kind": "text_absent",
+     "absent": "The specified profile could not be found",
+     "check": "https://steamcommunity.com/id/{u}", "profile": "https://steamcommunity.com/id/{u}"},
+    {"id": "chesscom", "name": "Chess.com",  "cat": "Gaming",   "kind": "status",
+     "check": "https://api.chess.com/pub/player/{u}", "profile": "https://www.chess.com/member/{u}"},
+    {"id": "lichess",  "name": "Lichess",    "cat": "Gaming",   "kind": "status",
+     "check": "https://lichess.org/api/user/{u}", "profile": "https://lichess.org/@/{u}"},
+    {"id": "fortnite", "name": "Fortnite",   "cat": "Gaming",   "kind": "link",
+     "note": "Epic names have no public lookup. Opens a stats-tracker search.",
+     "profile": "https://fortnitetracker.com/profile/all/{u}"},
+    {"id": "discord",  "name": "Discord",    "cat": "Gaming",   "kind": "link",
+     "note": "Discord has no public username lookup. Opens a Google search for the handle.",
+     "profile": "https://www.google.com/search?q=%22{u}%22+discord"},
+
+    {"id": "reddit",   "name": "Reddit",     "cat": "Social",   "kind": "status",
+     "check": "https://www.reddit.com/user/{u}/about.json", "profile": "https://www.reddit.com/user/{u}"},
+    {"id": "instagram","name": "Instagram",  "cat": "Social",   "kind": "link",
+     "note": "Login wall blocks automated checks. Opens the profile URL.",
+     "profile": "https://www.instagram.com/{u}/"},
+    {"id": "tiktok",   "name": "TikTok",     "cat": "Social",   "kind": "link",
+     "note": "Bot protection blocks automated checks. Opens the profile URL.",
+     "profile": "https://www.tiktok.com/@{u}"},
+    {"id": "x",        "name": "X",          "cat": "Social",   "kind": "link",
+     "note": "Login wall blocks automated checks. Opens the profile URL.",
+     "profile": "https://x.com/{u}"},
+
+    {"id": "soundcloud","name": "SoundCloud","cat": "Creative", "kind": "status",
+     "check": "https://soundcloud.com/{u}", "profile": "https://soundcloud.com/{u}"},
+    {"id": "medium",   "name": "Medium",     "cat": "Creative", "kind": "status",
+     "check": "https://medium.com/@{u}", "profile": "https://medium.com/@{u}"},
+]
+BY_ID = {s["id"]: s for s in SITES}
+NAME_RE = re.compile(r"^[A-Za-z0-9._\-]{1,40}$")
+
+
+def run_check(site, user):
+    url = site["check"].format(u=quote(user))
+    req = Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
+    t0 = time.time()
+    status, body = None, ""
+    try:
+        with urlopen(req, timeout=8) as r:
+            status = r.status
+            body = r.read(200_000).decode("utf-8", "ignore")
+    except HTTPError as e:
+        status = e.code
+    except Exception:
+        return {"state": "unknown", "ms": int((time.time() - t0) * 1000), "why": "network error"}
+    ms = int((time.time() - t0) * 1000)
+
+    if status == 404:
+        return {"state": "missing", "ms": ms}
+    if status != 200:
+        return {"state": "unknown", "ms": ms, "why": f"HTTP {status}"}
+
+    kind = site["kind"]
+    if kind == "text_absent":
+        return {"state": "missing" if site["absent"] in body else "found", "ms": ms}
+    if kind == "json_empty":
+        try:
+            data = json.loads(body)
+        except ValueError:
+            return {"state": "unknown", "ms": ms, "why": "bad response"}
+        return {"state": "missing" if not data else "found", "ms": ms}
+    return {"state": "found", "ms": ms}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, ctype, payload):
+        data = payload if isinstance(payload, bytes) else payload.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/":
+            return self.send(200, "text/html; charset=utf-8", PAGE)
+        if u.path == "/api/sites":
+            pub = [{k: s.get(k) for k in ("id", "name", "cat", "kind", "note")} for s in SITES]
+            return self.send(200, "application/json", json.dumps(pub))
+        if u.path == "/api/check":
+            site = BY_ID.get(q.get("site", [""])[0])
+            user = q.get("u", [""])[0]
+            if not site or not NAME_RE.match(user):
+                return self.send(400, "application/json", '{"error":"bad request"}')
+            profile = site["profile"].format(u=quote(user))
+            if site["kind"] == "link":
+                res = {"state": "link", "ms": 0}
+            else:
+                res = run_check(site, user)
+            res["url"] = profile
+            return self.send(200, "application/json", json.dumps(res))
+        self.send(404, "text/plain", "not found")
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Handle Hunt</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,800&family=Instrument+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --fog:#E8ECEF; --paper:#F7F8F9; --ink:#16202B; --mute:#6B7885; --line:#CDD5DC;
+  --found:#0E8F6B; --found-bg:#D5F0E6; --miss:#8A95A0; --unk:#B7791F; --unk-bg:#F6E7C8;
+  --mark:#3B2FD9; --mark-ink:#fff;
+}
+@media (prefers-color-scheme:dark){
+  :root{--fog:#10161C; --paper:#18212A; --ink:#E6ECF1; --mute:#8D9AA6; --line:#2B3743;
+  --found:#4CD6A8; --found-bg:#123A2E; --miss:#6B7885; --unk:#E6B450; --unk-bg:#3A2E12;
+  --mark:#8C84FF; --mark-ink:#10161C;}
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--fog);color:var(--ink);font:15px/1.5 "Instrument Sans",system-ui,sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:40px 24px 80px}
+h1{font:800 clamp(40px,7vw,76px)/.95 "Bricolage Grotesque",system-ui,sans-serif;letter-spacing:-.03em;margin:0 0 10px}
+.sub{color:var(--mute);max-width:52ch;margin:0 0 32px}
+.grid{display:grid;grid-template-columns:minmax(0,380px) minmax(0,1fr);gap:24px;align-items:start}
+@media(max-width:820px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:20px}
+label.big{display:block;font-weight:600;margin-bottom:8px}
+.field{display:flex;gap:8px}
+input[type=text]{flex:1;min-width:0;font:inherit;padding:12px 14px;border-radius:10px;border:1.5px solid var(--line);background:var(--fog);color:var(--ink)}
+input[type=text]:focus{outline:3px solid color-mix(in srgb,var(--mark) 35%,transparent);border-color:var(--mark)}
+button{font:inherit;cursor:pointer}
+.go{background:var(--mark);color:var(--mark-ink);border:0;border-radius:10px;padding:12px 20px;font-weight:600}
+.go:disabled{opacity:.5;cursor:default}
+.hint{color:var(--mute);font-size:13px;margin:8px 0 0;min-height:1.4em}
+.cat{margin-top:22px}
+.cat-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+.cat-head b{font:600 16px "Bricolage Grotesque",sans-serif}
+.cat-head button{background:none;border:0;color:var(--mark);font-size:13px;padding:0}
+.chips{display:flex;flex-wrap:wrap;gap:6px}
+.chip{position:relative}
+.chip input{position:absolute;opacity:0;inset:0;cursor:pointer}
+.chip span{display:block;padding:6px 12px;border-radius:999px;border:1.5px solid var(--line);background:var(--fog);color:var(--mute);font-weight:500;font-size:14px}
+.chip input:checked+span{background:var(--mark);border-color:var(--mark);color:var(--mark-ink)}
+.chip input:focus-visible+span{outline:3px solid color-mix(in srgb,var(--mark) 45%,transparent);outline-offset:2px}
+.bar{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.tally{font:600 18px "Bricolage Grotesque",sans-serif}
+.tally small{font:400 14px "Instrument Sans";color:var(--mute);margin-left:6px}
+.tools{display:flex;gap:8px;align-items:center;font-size:13px;color:var(--mute)}
+.tools button{background:var(--fog);border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:5px 10px;font-size:13px}
+.prog{height:4px;background:var(--line);border-radius:4px;overflow:hidden;margin-bottom:14px}
+.prog i{display:block;height:100%;width:0;background:var(--mark);transition:width .2s}
+.rows{display:flex;flex-direction:column}
+.row{display:grid;grid-template-columns:28px 1fr auto;gap:12px;align-items:center;padding:12px 4px;border-top:1px solid var(--line)}
+.row:first-child{border-top:0}
+.dot{width:12px;height:12px;border-radius:50%;background:var(--miss);margin:auto}
+.row.found .dot{background:var(--found);box-shadow:0 0 0 5px var(--found-bg)}
+.row.unknown .dot{background:var(--unk);box-shadow:0 0 0 5px var(--unk-bg)}
+.row.link .dot{background:transparent;border:2px solid var(--mute)}
+.row.pending .dot{animation:pulse 1s infinite alternate}
+@keyframes pulse{to{opacity:.25}}
+@media(prefers-reduced-motion:reduce){.row.pending .dot{animation:none}}
+.nm{font-weight:600}
+.meta{color:var(--mute);font-size:13px}
+.row.missing .nm{color:var(--mute);font-weight:500}
+a.open{color:var(--mark);font-weight:600;text-decoration:none;font-size:14px}
+a.open:hover{text-decoration:underline}
+.empty{color:var(--mute);padding:36px 8px;text-align:center}
+.foot{margin-top:28px;color:var(--mute);font-size:13px;max-width:70ch}
+</style></head>
+<body><div class="wrap">
+<h1>Handle Hunt</h1>
+<p class="sub">Find where a username has a public profile. Pick the sites, run the check, open what turns up.</p>
+<div class="grid">
+  <section class="panel" aria-label="Search setup">
+    <label class="big" for="q">Username or Gmail address</label>
+    <div class="field">
+      <input id="q" type="text" placeholder="e.g. ninja_42 or ninja_42@gmail.com" autocomplete="off" spellcheck="false">
+      <button class="go" id="go">Search</button>
+    </div>
+    <p class="hint" id="hint">For an email, only the part before the @ is used as the handle.</p>
+    <div id="cats"></div>
+  </section>
+  <section class="panel" aria-live="polite" aria-label="Results">
+    <div class="bar">
+      <div class="tally" id="tally">No search yet</div>
+      <div class="tools">
+        <label><input type="checkbox" id="hide"> Hide not found</label>
+        <button id="csv" disabled>Export CSV</button>
+      </div>
+    </div>
+    <div class="prog"><i id="prog"></i></div>
+    <div class="rows" id="rows"><div class="empty">Results appear here as each site answers.</div></div>
+  </section>
+</div>
+<p class="foot">“Not found” means the site returned no public profile for that exact handle. “Couldn’t check” means the site blocked or failed the request, so try it by hand. Matching handles are not proof of the same person. Use this only on handles you own or are authorised to research.</p>
+</div>
+<script>
+const $=s=>document.querySelector(s);
+let SITES=[], results=[], run=0;
+
+fetch('/api/sites').then(r=>r.json()).then(s=>{SITES=s;buildCats()});
+
+function buildCats(){
+  const cats=[...new Set(SITES.map(s=>s.cat))];
+  $('#cats').innerHTML=cats.map(c=>`
+    <div class="cat" data-cat="${c}">
+      <div class="cat-head"><b>${c}</b><button type="button" data-toggle="${c}">Toggle all</button></div>
+      <div class="chips">${SITES.filter(s=>s.cat===c).map(s=>`
+        <label class="chip"><input type="checkbox" value="${s.id}" checked><span>${s.name}</span></label>`).join('')}
+      </div></div>`).join('');
+  document.querySelectorAll('[data-toggle]').forEach(b=>b.onclick=()=>{
+    const boxes=[...document.querySelectorAll(`[data-cat="${b.dataset.toggle}"] input`)];
+    const all=boxes.every(x=>x.checked); boxes.forEach(x=>x.checked=!all);
+  });
+}
+
+function handle(){
+  let v=$('#q').value.trim();
+  if(v.includes('@')) v=v.split('@')[0];
+  return v;
+}
+
+async function search(){
+  const u=handle();
+  if(!/^[A-Za-z0-9._\-]{1,40}$/.test(u)){
+    $('#hint').textContent='Use 1–40 letters, numbers, dots, dashes or underscores.'; return;
+  }
+  const ids=[...document.querySelectorAll('#cats input:checked')].map(x=>x.value);
+  if(!ids.length){ $('#hint').textContent='Select at least one site.'; return; }
+  $('#hint').textContent=`Searching for “${u}”`;
+  const my=++run; results=[]; $('#csv').disabled=true; $('#go').disabled=true;
+  $('#rows').innerHTML=''; $('#prog').style.width='0';
+  const sel=SITES.filter(s=>ids.includes(s.id));
+  sel.forEach(s=>{
+    const d=document.createElement('div'); d.className='row pending'; d.id='r-'+s.id;
+    d.innerHTML=`<div class="dot"></div><div><div class="nm">${s.name}</div><div class="meta">Checking…</div></div><div></div>`;
+    $('#rows').appendChild(d);
+  });
+  let done=0;
+  const queue=[...sel];
+  async function worker(){
+    while(queue.length){
+      const s=queue.shift(); let r;
+      try{ r=await (await fetch(`/api/check?site=${s.id}&u=${encodeURIComponent(u)}`)).json(); }
+      catch(e){ r={state:'unknown',why:'request failed',url:''}; }
+      if(my!==run) return;
+      results.push({site:s.name,cat:s.cat,state:r.state,url:r.url||''});
+      paint(s,r); done++;
+      $('#prog').style.width=(done/sel.length*100)+'%'; tally();
+    }
+  }
+  await Promise.all(Array.from({length:6},worker));
+  if(my===run){ $('#go').disabled=false; $('#csv').disabled=false; tally(true); order(); }
+}
+
+function paint(s,r){
+  const el=$('#r-'+s.id); const st=r.state;
+  el.className='row '+st;
+  const label={found:'Profile found',missing:'Not found',unknown:'Couldn’t check'+(r.why?` (${r.why})`:''),link:s.note||'Manual check'}[st];
+  const act = st==='found' ? `<a class="open" href="${r.url}" target="_blank" rel="noopener">Open profile</a>`
+            : st==='link'  ? `<a class="open" href="${r.url}" target="_blank" rel="noopener">Open search</a>`
+            : st==='unknown'? `<a class="open" href="${r.url}" target="_blank" rel="noopener">Try by hand</a>` : '';
+  el.innerHTML=`<div class="dot"></div><div><div class="nm">${s.name}</div><div class="meta">${label}</div></div><div>${act}</div>`;
+  applyHide();
+}
+function order(){
+  const rank={found:0,unknown:1,link:2,missing:3};
+  const box=$('#rows');
+  [...box.children].sort((a,b)=>rank[a.className.split(' ')[1]]-rank[b.className.split(' ')[1]]).forEach(n=>box.appendChild(n));
+}
+function tally(final){
+  const f=results.filter(r=>r.state==='found').length;
+  const m=results.filter(r=>r.state==='missing').length;
+  const o=results.length-f-m;
+  $('#tally').innerHTML=`${f} found<small>${m} not found · ${o} need a manual look${final?'':' · running'}</small>`;
+}
+function applyHide(){
+  const h=$('#hide').checked;
+  document.querySelectorAll('.row.missing').forEach(r=>r.style.display=h?'none':'');
+}
+$('#hide').onchange=applyHide;
+$('#go').onclick=search;
+$('#q').addEventListener('keydown',e=>{ if(e.key==='Enter') search(); });
+$('#csv').onclick=()=>{
+  const lines=['site,category,result,url',...results.map(r=>[r.site,r.cat,r.state,r.url].map(x=>`"${x}"`).join(','))];
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([lines.join('\n')],{type:'text/csv'}));
+  a.download=`handle-hunt-${handle()}.csv`; a.click();
+};
+</script></body></html>
+"""
+
+if __name__ == "__main__":
+    host, port = "127.0.0.1", 8765
+    print(f"Handle Hunt running at http://{host}:{port}  (Ctrl+C to stop)")
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
